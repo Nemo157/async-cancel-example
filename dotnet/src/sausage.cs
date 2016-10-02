@@ -6,15 +6,8 @@ using System.Threading.Tasks;
 public interface IMessageBus {
     Task Publish(string topic, string message);
     Task Publish(string topic, string message, CancellationToken cancel);
-    Task<IMessageQueue> Bind(string topic);
-    Task<IMessageQueue> Bind(string topic, CancellationToken cancel);
-    Task Unbind(IMessageQueue queue);
-    Task Unbind(IMessageQueue queue, CancellationToken cancel);
-}
-
-public interface IMessageQueue {
-    Task<string> Dequeue();
-    Task<string> Dequeue(CancellationToken cancel);
+    Task<string> Receive(string topic);
+    Task<string> Receive(string topic, CancellationToken cancel);
 }
 
 // A small HTTP server like interface
@@ -33,85 +26,28 @@ public interface IHandler {
 
 // The handler
 public class Handler: IHandler {
-    int counter;
     readonly IMessageBus bus;
+    readonly Action<string> log = msg => Console.WriteLine($"{(DateTime.Now - Program.Start):s'.'fff} [Handler] {msg}");
 
     public Handler(IMessageBus bus) {
         this.bus = bus;
     }
 
     public async Task<Response> Handle(Request request, CancellationToken cancel) {
-        var my_topic = "/handler/responses/" + this.counter++;
-        var my_queue = await this.bus.Bind(my_topic);
-        try {
-            await this.bus.Publish("/service", my_topic + "|" + request.Foo);
-            string their_queue;
-            for (;;) {
-                var msg = (await my_queue.Dequeue(cancel)).Split('|');
-                switch (msg[0]) {
-                case "started":
-                    their_queue = msg[1];
-                    break;
-                case "finished":
-                    return new Response { Body = msg[1] };
-                }
+        log($"Got request with Foo: {request.Foo}");
+        log($"Starting request to service");
+        await this.bus.Publish("/service", request.Foo, cancel);
+        for (;;) {
+            try {
+                var msg = await this.bus.Receive($"/service/op", cancel);
+                log($"Finished request with result: {msg}");
+                return new Response { Body = msg };
+            } catch (OperationCanceledException) {
+                log($"Cancellation token was set, cancelling service");
+                await this.bus.Publish($"/service/op/cancel", "cancel");
+                throw;
             }
-        } finally {
-            await this.bus.Unbind(my_queue);
         }
-    }
-}
-
-// The other service
-public class Service {
-    int counter;
-    readonly IMessageBus bus;
-
-    public Service(IMessageBus bus) {
-        this.bus = bus;
-    }
-
-    public async Task Run(CancellationToken cancel) {
-        var queue = await this.bus.Bind("/service");
-        try {
-            for (;;) {
-                var msg = await queue.Dequeue(cancel);
-                var s = msg.Split('|');
-                await Operation(s[0], int.Parse(s[1]), cancel);
-            }
-        } finally {
-            await this.bus.Unbind(queue);
-        }
-    }
-
-    async Task Operation(string their_topic, int foo, CancellationToken cancel) {
-        var my_topic = "/service/responses/" + this.counter++;
-        var my_queue = await this.bus.Bind(my_topic);
-        try {
-            await this.bus.Publish(their_topic, "started|" + my_topic);
-            var operation_cancel = CancellationTokenSource.CreateLinkedTokenSource(cancel);
-            var operation = RunOperation(foo, operation_cancel.Token);
-            for (;;) {
-                var msg = my_queue.Dequeue(cancel);
-                var first = await Task.WhenAny(operation, msg);
-                if (first == msg && await msg == "cancel") {
-                    operation_cancel.Cancel();
-                    await this.bus.Publish(their_topic, "cancelled");
-                    return;
-                }
-                if (first == operation) {
-                    await this.bus.Publish(their_topic, "finished|" + await operation);
-                    return;
-                }
-            }
-        } finally {
-            await this.bus.Unbind(my_queue);
-        }
-    }
-
-    async Task<string> RunOperation(int foo, CancellationToken cancel) {
-        await Task.Delay(foo, cancel);
-        return foo.ToString();
     }
 }
 
@@ -123,9 +59,29 @@ public class Example {
 
         var running = Task.Run(() => service.Run(CancellationToken.None));
 
+        Func<Task<Response>, object> wait = task => {
+            try { return task.Result; }
+            catch (AggregateException ex) { return ex.Unwrap(); }
+        };
+
         // First example, simple 100ms delay completing successfully
-        var example = Task.Run(() => handler.Handle(new Request { Foo = "100" }, CancellationToken.None));
-        example.Wait();
-        Console.WriteLine("First example result: {0}", example.Result);
+        {
+            var example = Task.Run(() => handler.Handle(new Request { Foo = "100" }, CancellationToken.None));
+            var result = wait(example);
+            Console.WriteLine($"First example result: {result}");
+        }
+
+        Console.WriteLine();
+
+        // Second example, 200ms delay cancelled after 100ms
+        {
+            var source = new CancellationTokenSource(100);
+            var example = Task.Run(() => handler.Handle(new Request { Foo = "200" }, source.Token));
+            var result = wait(example);
+            Console.WriteLine($"Second example result: {result}");
+        }
+
+        service.Stop();
+        running.Wait();
     }
 }
