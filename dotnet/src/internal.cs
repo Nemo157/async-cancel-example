@@ -22,7 +22,7 @@ public class MessageBus: IMessageBus {
 
     public async Task Publish(string topic, string message, CancellationToken cancel) {
         await Task.Delay(10, cancel);
-        var queue = this.queues.GetOrAdd(topic, new AsyncProducerConsumerQueue<string>());
+        var queue = this.queues.GetOrAdd(topic, _ => new AsyncProducerConsumerQueue<string>());
         await queue.EnqueueAsync(message, cancel);
     }
 
@@ -31,7 +31,7 @@ public class MessageBus: IMessageBus {
     }
 
     public async Task<string> Receive(string topic, CancellationToken cancel) {
-        var queue = this.queues.GetOrAdd(topic, new AsyncProducerConsumerQueue<string>());
+        var queue = this.queues.GetOrAdd(topic, _ => new AsyncProducerConsumerQueue<string>());
         return await queue.DequeueAsync(cancel);
     }
 }
@@ -39,37 +39,44 @@ public class MessageBus: IMessageBus {
 public class Service {
     readonly IMessageBus bus;
     readonly Action<string> log = msg => Console.WriteLine($"{(DateTime.Now - Program.Start):s'.'fff} [Service] {msg}");
-    bool Running = true;
+    readonly CancellationTokenSource Cancel = new CancellationTokenSource();
 
     public Service(IMessageBus bus) {
         this.bus = bus;
     }
 
-    public async Task Run(CancellationToken cancel) {
-        while (this.Running) {
-            var msg = await this.bus.Receive("/service", cancel);
-            log($"[Run] Got start message: {msg}");
-            await Operation(int.Parse(msg), cancel);
-            log($"[Run] Handled msg");
+    public async Task Run() {
+        log($"[Run] Service starting");
+        while (!this.Cancel.IsCancellationRequested) {
+            try {
+                var msg = await this.bus.Receive("/service", this.Cancel.Token);
+                log($"[Run] Got start message: {msg}");
+                await Operation(int.Parse(msg));
+                log($"[Run] Handled msg");
+            } catch (OperationCanceledException) {
+            }
         }
+        log($"[Run] Service stopping");
     }
 
     public void Stop() {
-        this.Running = false;
+        this.Cancel.Cancel();
     }
 
-    async Task Operation(int foo, CancellationToken cancel) {
+    async Task Operation(int foo) {
         log($"[Operation] Starting operation");
-        var operation_cancel = CancellationTokenSource.CreateLinkedTokenSource(cancel);
-        var operation = RunOperation(foo, operation_cancel.Token);
+        var op_cancel = new CancellationTokenSource();
+        var operation = RunOperation(foo, op_cancel.Token);
         for (;;) {
-            var msg = this.bus.Receive($"/service/op/cancel", cancel);
+            var msg_cancel = new CancellationTokenSource();
+            var msg = this.bus.Receive("/service/op/cancel", msg_cancel.Token);
             var first = await Task.WhenAny(operation, msg);
             if (first == msg && await msg == "cancel") {
                 log($"[Operation] Received cancel msg");
-                operation_cancel.Cancel();
+                op_cancel.Cancel();
                 return;
             }
+            msg_cancel.Cancel();
             if (first == operation) {
                 log($"[Operation] finished");
                 await this.bus.Publish($"/service/op", operation.Result);

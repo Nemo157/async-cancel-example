@@ -57,26 +57,26 @@ public class Example {
         var handler = new Handler(bus);
         var service = new Service(bus);
 
-        var running = Task.Run(() => service.Run(CancellationToken.None));
+        var running = Task.Run(service.Run);
 
         Func<Task<Response>, object> wait = task => {
             try { return task.Result; }
             catch (AggregateException ex) { return ex.Unwrap(); }
         };
 
-        // First example, simple 100ms delay completing successfully
+        // First example, simple 1s delay completing successfully
         {
-            var example = Task.Run(() => handler.Handle(new Request { Foo = "100" }, CancellationToken.None));
+            var example = Task.Run(() => handler.Handle(new Request { Foo = "1000" }, CancellationToken.None));
             var result = wait(example);
             Console.WriteLine($"First example result: {result}");
         }
 
         Console.WriteLine();
 
-        // Second example, 200ms delay cancelled after 100ms
+        // Second example, 2s delay cancelled after 500ms
         {
-            var source = new CancellationTokenSource(100);
-            var example = Task.Run(() => handler.Handle(new Request { Foo = "200" }, source.Token));
+            var source = new CancellationTokenSource(500);
+            var example = Task.Run(() => handler.Handle(new Request { Foo = "2000" }, source.Token));
             var result = wait(example);
             Console.WriteLine($"Second example result: {result}");
         }
